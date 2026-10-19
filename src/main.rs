@@ -60,24 +60,20 @@ async fn main() -> Result<()> {
             }
             let agent = load_key(&cfg.data_dir.join("agent.key"))?;
             let mut venue = lightpool::Papertrade::new(
-                cfg.http_url.clone(),
+                cfg.ws_url.clone(),
                 http,
                 wallet,
                 agent,
                 cfg.paper_market.clone(),
                 cfg.instrument,
                 cfg.data_dir.join("agent.auth"),
-            );
+            )?;
             info!(
                 "venue=papertrade_on_lightpool user {} agent {}",
                 venue.user_address(),
                 venue.agent_address()
             );
-            venue.subscribe_account(
-                cfg.ws_url.clone(),
-                accounts.clone(),
-                cancel.clone(),
-            );
+            venue.subscribe_account(accounts.clone(), cancel.clone());
             Box::new(venue)
         }
         other => bail!("unknown venue {other}"),

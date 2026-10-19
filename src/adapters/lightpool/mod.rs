@@ -1,13 +1,19 @@
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::SignerSync;
-use alloy::sol_types::{eip712_domain, SolStruct};
 use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
+use lightpool_sdk::lightpool_types::{
+    eip712_hash_for_tx_digest, AuthScheme, Signature, SignedTransaction, TransactionReceipt,
+};
+use lightpool_sdk::{
+    parse_token_contract, ActionBuilder, Address, PaperClaimParams, PaperCloseParams,
+    PaperOpenParams, PaperStakeParams, SetAgentParams, Signer,
+    TransactionBuilder,
+};
 use log::{info, warn};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 
@@ -15,20 +21,18 @@ use crate::account::{Account, AccountStore, Paper, Position};
 
 const LIGHTPOOL_SCALE: u128 = 1_000_000;
 
-alloy::sol! {
-    struct LightPoolTx {
-        bytes32 digest;
-    }
-}
-
 pub struct Papertrade {
-    app_url: String,
+    indexer_url: String,
+    ws_url: String,
     http: reqwest::Client,
     wallet: PrivateKeySigner,
-    agent: PrivateKeySigner,
+    wallet_addr: Address,
+    agent: Signer,
     user: String,
     agent_addr: String,
+    user_addr: Address,
     market: String,
+    market_contract: lightpool_sdk::lightpool_types::ContractAddress,
     instrument: u32,
     authorized: bool,
     auth_path: std::path::PathBuf,
@@ -36,44 +40,44 @@ pub struct Papertrade {
 }
 
 #[derive(Deserialize)]
-struct PreparedTx {
-    digest_hex: String,
-    unsigned_tx_hex: String,
-    auth_scheme: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct SubmittedTx {
-    #[serde(default)]
-    position: Option<u64>,
+struct SubmitResponse {
+    receipt: TransactionReceipt,
 }
 
 impl Papertrade {
     pub fn new(
-        app_url: String,
+        ws_url: String,
         http: reqwest::Client,
         wallet: PrivateKeySigner,
         agent: PrivateKeySigner,
         market: String,
         instrument: u32,
         auth_path: std::path::PathBuf,
-    ) -> Self {
-        let user = format!("{:#x}", wallet.address());
-        let agent_addr = format!("{:#x}", agent.address());
+    ) -> Result<Self> {
+        let wallet_addr = sdk_address(&wallet)?;
+        let agent_signer = sdk_signer(&agent)?;
+        let user = wallet_addr.to_hex();
+        let agent_addr = agent_signer.address().to_hex();
         let authorized = auth_matches(&auth_path, &user, &agent_addr);
-        Self {
-            app_url: app_url.trim_end_matches('/').to_string(),
+        let market_contract =
+            parse_token_contract(market.trim()).map_err(|err| anyhow::anyhow!(err))?;
+        Ok(Self {
+            indexer_url: indexer_http_from_ws(&ws_url),
+            ws_url,
             http,
             wallet,
-            agent,
+            wallet_addr,
+            agent: agent_signer,
             user,
             agent_addr,
+            user_addr: wallet_addr,
             market,
+            market_contract,
             instrument,
             authorized,
             auth_path,
             accounts: None,
-        }
+        })
     }
 
     pub fn user_address(&self) -> &str {
@@ -93,12 +97,20 @@ impl Papertrade {
             return Ok(());
         }
         info!("setting agent {}", self.agent_addr);
-        self.post_prepare(
-            "/api/agent/prepare",
-            json!({ "user": self.user, "agent": self.agent_addr }),
-            true,
-        )
-        .await?;
+        let action = ActionBuilder::set_agent(SetAgentParams {
+            agent: self.agent.address(),
+        })
+        .context("build set_agent")?;
+        let tx = TransactionBuilder::new()
+            .sender(self.wallet_addr)
+            .expiration(u64::MAX)
+            .add_action(action)
+            .build()
+            .context("build set_agent tx")?;
+        let hash = eip712_hash_for_tx_digest(&tx.digest());
+        let signature = sign_eip712(&self.wallet, &hash)?;
+        let signed = SignedTransaction::new_with_scheme(tx, signature, AuthScheme::Eip712);
+        self.submit_tx(signed).await?;
         if let Some(parent) = self.auth_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -108,24 +120,22 @@ impl Papertrade {
     }
 
     pub async fn submit_open(&mut self, is_long: bool, size: u128, leverage: u32) -> Result<()> {
-        let margin = human_amount(U256::from(size), LIGHTPOOL_SCALE);
-        let submitted = self.post_prepare(
-            "/api/paper/open/prepare",
-            json!({
-                "user": self.user,
-                "agent": self.agent_addr,
-                "market": self.market,
-                "instrument": self.instrument,
-                "is_long": is_long,
-                "margin": margin,
-                "leverage": leverage,
-                "fund_from_queued": false,
-            }),
-            false,
+        let margin = u64::try_from(size).context("margin does not fit")?;
+        let action = ActionBuilder::open_paper(
+            self.market_contract,
+            PaperOpenParams {
+                instrument: self.instrument,
+                is_long,
+                margin,
+                leverage: u64::from(leverage),
+                fund_from_queued: false,
+            },
         )
-        .await?;
-        if let Some(id) = submitted.position {
-            self.note_open(is_long, id, U256::from(size)).await;
+        .context("build open_paper")?;
+        let submitted = self.submit_tx(self.agent_tx(action)?).await?;
+        if let Some(opened) = lightpool_sdk::paper_events::extract_paper_opened(&submitted.receipt)
+        {
+            self.note_open(is_long, opened.position, U256::from(size)).await;
         }
         Ok(())
     }
@@ -133,93 +143,58 @@ impl Papertrade {
     pub async fn submit_close(&mut self, ids: &[String]) -> Result<()> {
         for id in ids {
             let position: u64 = id.parse().context("lightpool position id")?;
-            self.post_prepare(
-                "/api/paper/close/prepare",
-                json!({
-                    "user": self.user,
-                    "agent": self.agent_addr,
-                    "market": self.market,
-                    "position": position,
-                }),
-                false,
+            let action = ActionBuilder::close_paper(
+                self.market_contract,
+                PaperCloseParams { position },
             )
-            .await?;
+            .context("build close_paper")?;
+            self.submit_tx(self.agent_tx(action)?).await?;
             self.note_close(id).await;
         }
         Ok(())
     }
 
     pub async fn submit_stake(&mut self, amount: U256, _balance: U256) -> Result<()> {
-        let human = human_amount(amount, LIGHTPOOL_SCALE);
-        self.post_prepare(
-            "/api/paper/stake/prepare",
-            json!({
-                "user": self.user,
-                "agent": self.agent_addr,
-                "market": self.market,
-                "amount": human,
-            }),
-            false,
-        )
-        .await?;
+        let raw: u64 = amount.try_into().context("stake amount does not fit")?;
+        let action = ActionBuilder::stake_paper(self.market_contract, PaperStakeParams { amount: raw })
+            .context("build stake_paper")?;
+        self.submit_tx(self.agent_tx(action)?).await?;
         self.note_stake(amount).await;
         Ok(())
     }
 
     pub async fn submit_claim(&mut self) -> Result<()> {
-        self.post_prepare(
-            "/api/paper/claim/prepare",
-            json!({
-                "user": self.user,
-                "agent": self.agent_addr,
-                "market": self.market,
-            }),
-            false,
-        )
-        .await?;
+        let action = ActionBuilder::claim_paper(self.market_contract, PaperClaimParams {})
+            .context("build claim_paper")?;
+        self.submit_tx(self.agent_tx(action)?).await?;
         self.note_claim().await;
         Ok(())
     }
 
-    async fn post_prepare(&self, path: &str, body: Value, wallet_sign: bool) -> Result<SubmittedTx> {
-        let url = format!("{}{path}", self.app_url);
-        let resp = self.http.post(&url).json(&body).send().await?;
-        let status = resp.status();
-        let text = resp.text().await?;
-        if !status.is_success() {
-            bail!("{path} {status} {text}");
-        }
-        let prepared: PreparedTx = serde_json::from_str(&text).with_context(|| path.to_string())?;
-        let signature = if wallet_sign || prepared.auth_scheme.as_deref() == Some("eip712") {
-            sign_eip712(&self.wallet, &prepared.digest_hex)?
-        } else {
-            sign_native(&self.agent, &prepared.digest_hex)?
-        };
-        let scheme = prepared.auth_scheme.unwrap_or_else(|| {
-            if wallet_sign {
-                "eip712".into()
-            } else {
-                "native".into()
-            }
-        });
-        let submit = format!("{}/api/tx/sign/submit", self.app_url);
-        let resp = self
-            .http
-            .post(submit)
-            .json(&json!({
-                "unsigned_tx_hex": prepared.unsigned_tx_hex,
-                "signature": signature,
-                "auth_scheme": scheme,
-            }))
-            .send()
-            .await?;
+    fn agent_tx(&self, action: lightpool_sdk::Action) -> Result<SignedTransaction> {
+        TransactionBuilder::new()
+            .sender(self.agent.address())
+            .account(self.user_addr)
+            .expiration(u64::MAX)
+            .add_action(action)
+            .build_and_sign_only(&self.agent)
+            .context("sign agent tx")
+    }
+
+    async fn submit_tx(&self, tx: SignedTransaction) -> Result<SubmitResponse> {
+        let url = format!("{}/tx/submit", self.indexer_url);
+        let resp = self.http.post(&url).json(&SubmitBody { tx }).send().await?;
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
             bail!("submit {status} {text}");
         }
-        info!("{path} submitted");
-        Ok(serde_json::from_str(&text).unwrap_or(SubmittedTx { position: None }))
+        let submitted: SubmitResponse = serde_json::from_str(&text).context("decode submit")?;
+        if !submitted.receipt.is_success() {
+            bail!("transaction failed: {:?}", submitted.receipt.status);
+        }
+        info!("submitted to {}", self.indexer_url);
+        Ok(submitted)
     }
 
     async fn note_open(&self, is_long: bool, id: u64, margin: U256) {
@@ -271,13 +246,9 @@ impl Papertrade {
         }
     }
 
-    pub fn subscribe_account(
-        &mut self,
-        ws_url: String,
-        store: AccountStore,
-        cancel: CancellationToken,
-    ) {
+    pub fn subscribe_account(&mut self, store: AccountStore, cancel: CancellationToken) {
         self.accounts = Some(store.clone());
+        let ws_url = self.ws_url.clone();
         let user = self.user.clone();
         let market = self.market.clone();
         let instrument = self.instrument;
@@ -465,52 +436,38 @@ fn auth_matches(path: &std::path::Path, user: &str, agent: &str) -> bool {
     lines.next() == Some(user) && lines.next() == Some(agent)
 }
 
-fn human_amount(raw: U256, scale: u128) -> f64 {
-    let scale = U256::from(scale);
-    if scale.is_zero() {
-        return 0.0;
+#[derive(serde::Serialize)]
+struct SubmitBody {
+    tx: SignedTransaction,
+}
+
+fn indexer_http_from_ws(ws_url: &str) -> String {
+    let trimmed = ws_url.trim().trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix("/ws").unwrap_or(trimmed);
+    if let Some(rest) = trimmed.strip_prefix("ws://") {
+        format!("http://{rest}")
+    } else if let Some(rest) = trimmed.strip_prefix("wss://") {
+        format!("https://{rest}")
+    } else {
+        trimmed.to_string()
     }
-    let whole = raw / scale;
-    let frac = raw % scale;
-    let whole_f: f64 = whole.to_string().parse().unwrap_or(0.0);
-    let frac_f: f64 = frac.to_string().parse().unwrap_or(0.0);
-    whole_f + frac_f / scale.to_string().parse::<f64>().unwrap_or(1.0)
 }
 
-fn sign_eip712(wallet: &PrivateKeySigner, digest_hex: &str) -> Result<String> {
-    let digest: B256 = digest_hex.parse().context("tx digest")?;
-    let msg = LightPoolTx { digest };
-    let domain = eip712_domain! {
-        name: "LightPool",
-        version: "1",
-        chain_id: 1337,
-        verifying_contract: Address::ZERO,
-    };
-    let hash = msg.eip712_signing_hash(&domain);
-    let signature = wallet.sign_hash_sync(&hash)?;
-    Ok(format!("0x{:064x}{:064x}", signature.r(), signature.s()))
+fn sdk_signer(key: &PrivateKeySigner) -> Result<Signer> {
+    let bytes: [u8; 32] = key.to_bytes().into();
+    Signer::from_secret_key_bytes(&bytes).context("lightpool signer")
 }
 
-fn sign_native(agent: &PrivateKeySigner, digest_hex: &str) -> Result<String> {
-    let digest = decode_hex(digest_hex)?;
-    let hashed = Sha256::digest(&digest);
-    let hash = B256::from_slice(&hashed);
-    let signature = agent.sign_hash_sync(&hash)?;
-    Ok(format!("0x{:064x}{:064x}", signature.r(), signature.s()))
+fn sdk_address(key: &PrivateKeySigner) -> Result<Address> {
+    Ok(sdk_signer(key)?.address())
 }
 
-fn decode_hex(raw: &str) -> Result<Vec<u8>> {
-    let body = raw
-        .trim()
-        .trim_start_matches("0x")
-        .trim_start_matches("0X");
-    if body.len() % 2 != 0 {
-        bail!("odd hex length");
-    }
-    (0..body.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&body[i..i + 2], 16).context("hex"))
-        .collect()
+fn sign_eip712(wallet: &PrivateKeySigner, hash: &[u8; 32]) -> Result<Signature> {
+    let signature = wallet.sign_hash_sync(&B256::from(*hash))?;
+    let mut raw = [0u8; 64];
+    raw[..32].copy_from_slice(&signature.r().to_be_bytes::<32>());
+    raw[32..].copy_from_slice(&signature.s().to_be_bytes::<32>());
+    bincode::deserialize(&raw).context("eip712 signature")
 }
 
 fn json_u256(value: Option<&Value>) -> U256 {

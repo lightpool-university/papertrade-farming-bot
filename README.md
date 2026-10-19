@@ -40,12 +40,11 @@ A balance that is too small for those limits is rejected by the exchange.
 
 ## Run on LightPool
 
-`PAPER_MARKET` is required. Point HTTP at papertrade-app and the WebSocket at the indexer.
+The bot talks only to the indexer. `PAPERTRADE_WS_URL` is the indexer WebSocket. Submits go to `POST /tx/submit` on the same host (`ws://127.0.0.1:3002/ws` becomes `http://127.0.0.1:3002/tx/submit`). `PAPER_MARKET` is required.
 
 ```bash
 export PAPERTRADE_WALLET_KEY=0x...
 export PAPERTRADE_VENUE=papertrade_on_lightpool
-export PAPERTRADE_HTTP_URL=http://127.0.0.1:3001
 export PAPERTRADE_WS_URL=ws://127.0.0.1:3002/ws
 export PAPER_MARKET=0x...
 cargo run --release
@@ -61,8 +60,8 @@ Flags and environment variables are the same names. `--leverage 50` is `PAPERTRA
 |---|---|---|
 | `PAPERTRADE_WALLET_KEY` | required | Wallet private key. `0x` is optional. |
 | `PAPERTRADE_VENUE` | `papertrade_on_hyperliquid` | `papertrade_on_hyperliquid` or `papertrade_on_lightpool`. Aliases: `exchange`, `lightpool`. |
-| `PAPERTRADE_HTTP_URL` | `https://exchange.papertrade.xyz` | Exchange or papertrade-app base URL. |
-| `PAPERTRADE_WS_URL` | `ws://127.0.0.1:3002/ws` | Indexer WebSocket. LightPool only. |
+| `PAPERTRADE_HTTP_URL` | `https://exchange.papertrade.xyz` | Online Papertrade base URL. LightPool does not use this. |
+| `PAPERTRADE_WS_URL` | `ws://127.0.0.1:3002/ws` | Indexer WebSocket. LightPool also posts transactions to this host. |
 | `PAPERTRADE_DATA_DIR` | `data` | Session key, agent key, and nonce files. |
 | `PAPERTRADE_COIN` | `BTC` | Hyperliquid price coin. |
 | `PAPERTRADE_LEVERAGE` | `50` | Leverage for both legs. |
