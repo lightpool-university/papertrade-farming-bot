@@ -1,0 +1,25 @@
+[package]
+name = "papertrade-farming-bot"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "papertrade-farming-bot"
+path = "src/main.rs"
+
+[dependencies]
+alloy = { version = "2.0.5", default-features = false, features = ["sol-types", "signers", "signer-local", "contract"] }
+anyhow = "1.0"
+async-trait = "0.1"
+clap = { version = "4.4", features = ["derive", "env"] }
+env_logger = "0.9"
+futures-util = "0.3"
+log = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+tokio-util = "0.7"
