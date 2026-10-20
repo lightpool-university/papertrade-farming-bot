@@ -6,15 +6,15 @@ use clap::Parser;
 #[command(name = "papertrade-farming-bot")]
 pub struct Config {
     #[arg(long, env = "PAPERTRADE_WALLET_KEY")]
-    pub wallet_key: String,
+    pub wallet_key: Option<String>,
 
     #[arg(long, env = "PAPERTRADE_DATA_DIR", default_value = "data")]
     pub data_dir: PathBuf,
 
-    #[arg(long, env = "PAPERTRADE_HTTP_URL", default_value = "https://exchange.papertrade.xyz")]
-    pub http_url: String,
+    #[arg(long, env = "PAPERTRADE_HTTP_URL")]
+    pub http_url: Option<String>,
 
-    #[arg(long, env = "PAPERTRADE_WS_URL", default_value = "ws://127.0.0.1:3002/ws")]
+    #[arg(long, env = "PAPERTRADE_WS_URL", default_value = "ws://127.0.0.1:3002/api/ws")]
     pub ws_url: String,
 
     #[arg(
@@ -52,7 +52,7 @@ pub struct Config {
     #[arg(long, env = "PAPERTRADE_VENUE", default_value = "papertrade_on_hyperliquid")]
     pub venue: String,
 
-    #[arg(long, env = "PAPER_MARKET", default_value = "")]
+    #[arg(long, env = "PAPER_MARKET", default_value = "0x0c01000000000001")]
     pub paper_market: String,
 
     #[arg(long, env = "PAPER_INSTRUMENT", default_value_t = 0)]
@@ -60,3 +60,11 @@ pub struct Config {
 }
 
 pub const REWARD_SCALE: u128 = 1_000_000_000_000_000_000_000_000_000;
+
+/// Anvil account #2. Used on LightPool when PAPERTRADE_WALLET_KEY is unset.
+/// Address: 0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC
+pub const LIGHTPOOL_DEFAULT_WALLET_KEY: &str =
+    "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
+
+pub const HYPERLIQUID_DEFAULT_HTTP_URL: &str = "https://exchange.papertrade.xyz";
+pub const LIGHTPOOL_DEFAULT_HTTP_URL: &str = "http://127.0.0.1:3002";

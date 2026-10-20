@@ -7,6 +7,9 @@ pub struct Position {
     pub is_long: bool,
     pub entry: f64,
     pub bust: f64,
+    pub margin: f64,
+    pub size: f64,
+    pub notional: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +39,11 @@ pub struct Account {
     pub inflight: Vec<Inflight>,
     pub token_scale: u128,
     pub indexed_claim: bool,
+    /// PAPER per $1 loss (`rate_ppm / 1e6`). Bootstrap flat default is 100.
+    pub mint_rate_raw: u64,
 }
+
+/// Bootstrap `flat_rate_ppm` (100 PAPER per $1 loss).
+pub const DEFAULT_MINT_RATE_RAW: u64 = 100_000_000;
 
 pub type AccountStore = std::sync::Arc<RwLock<Option<Account>>>;

@@ -52,7 +52,7 @@ pub fn spawn_price_feed(
                 _ = tokio::time::sleep(wait) => {
                     match poll_mid(&http, &info_url, &coin).await {
                         Ok(px) => {
-                            info!("no {coin} trade for {stale_ms}ms, polled price {px}");
+                            info!("poll px={px}");
                             last = Instant::now();
                             if tx.send(PriceTick { px }).await.is_err() {
                                 break;
@@ -115,7 +115,7 @@ async fn trades_session(
                 let msg = msg?;
                 match msg {
                     Message::Text(text) => {
-                        if let Some(px) = last_trade_px(&text, coin) {
+                        if let Some(px) = handle_trades(&text, coin) {
                             if tx.send(px).await.is_err() {
                                 break;
                             }
@@ -133,7 +133,7 @@ async fn trades_session(
     Ok(())
 }
 
-fn last_trade_px(text: &str, coin: &str) -> Option<f64> {
+fn handle_trades(text: &str, coin: &str) -> Option<f64> {
     let value: Value = serde_json::from_str(text).ok()?;
     if value.get("channel").and_then(|v| v.as_str()) != Some("trades") {
         return None;
@@ -145,7 +145,16 @@ fn last_trade_px(text: &str, coin: &str) -> Option<f64> {
         if !trade_coin.eq_ignore_ascii_case(coin) {
             continue;
         }
-        px = parse_px(trade.get("px"));
+        let trade_px = parse_px(trade.get("px"));
+        match trade_px {
+            Some(p) => {
+                info!("trade px={p}");
+                px = Some(p);
+            }
+            None => {
+                warn!("trade skipped bad px coin={trade_coin}");
+            }
+        }
     }
     px
 }

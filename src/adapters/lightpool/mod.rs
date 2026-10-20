@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 
-use crate::account::{Account, AccountStore, Paper, Position};
+use crate::account::{Account, AccountStore, Paper, Position, DEFAULT_MINT_RATE_RAW};
 
 const LIGHTPOOL_SCALE: u128 = 1_000_000;
 
@@ -46,6 +46,7 @@ struct SubmitResponse {
 
 impl Papertrade {
     pub fn new(
+        indexer_url: String,
         ws_url: String,
         http: reqwest::Client,
         wallet: PrivateKeySigner,
@@ -62,7 +63,7 @@ impl Papertrade {
         let market_contract =
             parse_token_contract(market.trim()).map_err(|err| anyhow::anyhow!(err))?;
         Ok(Self {
-            indexer_url: indexer_http_from_ws(&ws_url),
+            indexer_url: indexer_url.trim_end_matches('/').to_string(),
             ws_url,
             http,
             wallet,
@@ -135,20 +136,30 @@ impl Papertrade {
         let submitted = self.submit_tx(self.agent_tx(action)?).await?;
         if let Some(opened) = lightpool_sdk::paper_events::extract_paper_opened(&submitted.receipt)
         {
-            self.note_open(is_long, opened.position, U256::from(size)).await;
+            self.note_open(is_long, opened.position, U256::from(size), leverage)
+                .await;
         }
         Ok(())
     }
 
     pub async fn submit_close(&mut self, ids: &[String]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        if ids.len() > 2 {
+            bail!("lightpool close supports at most 2 positions per tx");
+        }
+        let positions = ids
+            .iter()
+            .map(|id| id.parse().context("lightpool position id"))
+            .collect::<Result<Vec<u64>>>()?;
+        let action = ActionBuilder::close_paper(
+            self.market_contract,
+            PaperCloseParams { positions },
+        )
+        .context("build close_paper")?;
+        self.submit_tx(self.agent_tx(action)?).await?;
         for id in ids {
-            let position: u64 = id.parse().context("lightpool position id")?;
-            let action = ActionBuilder::close_paper(
-                self.market_contract,
-                PaperCloseParams { position },
-            )
-            .context("build close_paper")?;
-            self.submit_tx(self.agent_tx(action)?).await?;
             self.note_close(id).await;
         }
         Ok(())
@@ -182,7 +193,7 @@ impl Papertrade {
     }
 
     async fn submit_tx(&self, tx: SignedTransaction) -> Result<SubmitResponse> {
-        let url = format!("{}/tx/submit", self.indexer_url);
+        let url = format!("{}/api/tx/submit", self.indexer_url);
         let resp = self.http.post(&url).json(&SubmitBody { tx }).send().await?;
         let status = resp.status();
         let text = resp.text().await?;
@@ -197,7 +208,7 @@ impl Papertrade {
         Ok(submitted)
     }
 
-    async fn note_open(&self, is_long: bool, id: u64, margin: U256) {
+    async fn note_open(&self, is_long: bool, id: u64, margin: U256, leverage: u32) {
         let Some(store) = &self.accounts else {
             return;
         };
@@ -208,11 +219,16 @@ impl Papertrade {
             return;
         }
         account.available = account.available.saturating_sub(margin);
+        let margin_f = u256_to_f64(margin) / LIGHTPOOL_SCALE as f64;
+        let notional = margin_f * leverage.max(1) as f64;
         account.positions.push(Position {
             id,
             is_long,
             entry: 0.0,
             bust: 0.0,
+            margin: margin_f,
+            size: 0.0,
+            notional,
         });
     }
 
@@ -358,6 +374,11 @@ async fn apply_state(store: &AccountStore, text: &str, instrument: u32) -> Resul
                 .collect()
         })
         .unwrap_or_default();
+    let mint_rate_raw = paper_v
+        .get("mint_rate_raw")
+        .and_then(|v| v.as_u64())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MINT_RATE_RAW);
     let account = Account {
         revision: 0,
         available: json_u256(account_v.get("available_raw")),
@@ -373,13 +394,8 @@ async fn apply_state(store: &AccountStore, text: &str, instrument: u32) -> Resul
         inflight: Vec::new(),
         token_scale: LIGHTPOOL_SCALE,
         indexed_claim: true,
+        mint_rate_raw,
     };
-    info!(
-        "paper user state positions={} available={} paper={}",
-        account.positions.len(),
-        account.available,
-        account.paper.balance
-    );
     *store.write().await = Some(account);
     Ok(())
 }
@@ -393,19 +409,30 @@ fn parse_position(value: &Value, instrument: u32) -> Option<Position> {
         Value::String(s) => s.clone(),
         _ => return None,
     };
+    let entry = json_f64(value.get("entry_price")).unwrap_or(0.0);
+    let margin = json_f64(value.get("margin")).unwrap_or_else(|| {
+        value
+            .get("margin_raw")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as f64 / LIGHTPOOL_SCALE as f64)
+            .unwrap_or(0.0)
+    });
+    let notional = json_f64(value.get("notional")).unwrap_or_else(|| {
+        value
+            .get("notional_raw")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as f64 / LIGHTPOOL_SCALE as f64)
+            .unwrap_or(0.0)
+    });
+    let size = if entry > 0.0 { notional / entry } else { 0.0 };
     Some(Position {
         id,
         is_long: value.get("is_long").and_then(|v| v.as_bool()).unwrap_or(false),
-        entry: value
-            .get("entry_price")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0),
-        bust: value
-            .get("bust_price")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0),
+        entry,
+        bust: json_f64(value.get("bust_price")).unwrap_or(0.0),
+        margin,
+        size,
+        notional,
     })
 }
 
@@ -425,6 +452,7 @@ fn blank_account() -> Account {
         inflight: Vec::new(),
         token_scale: LIGHTPOOL_SCALE,
         indexed_claim: true,
+        mint_rate_raw: DEFAULT_MINT_RATE_RAW,
     }
 }
 
@@ -439,18 +467,6 @@ fn auth_matches(path: &std::path::Path, user: &str, agent: &str) -> bool {
 #[derive(serde::Serialize)]
 struct SubmitBody {
     tx: SignedTransaction,
-}
-
-fn indexer_http_from_ws(ws_url: &str) -> String {
-    let trimmed = ws_url.trim().trim_end_matches('/');
-    let trimmed = trimmed.strip_suffix("/ws").unwrap_or(trimmed);
-    if let Some(rest) = trimmed.strip_prefix("ws://") {
-        format!("http://{rest}")
-    } else if let Some(rest) = trimmed.strip_prefix("wss://") {
-        format!("https://{rest}")
-    } else {
-        trimmed.to_string()
-    }
 }
 
 fn sdk_signer(key: &PrivateKeySigner) -> Result<Signer> {
@@ -468,6 +484,18 @@ fn sign_eip712(wallet: &PrivateKeySigner, hash: &[u8; 32]) -> Result<Signature> 
     raw[..32].copy_from_slice(&signature.r().to_be_bytes::<32>());
     raw[32..].copy_from_slice(&signature.s().to_be_bytes::<32>());
     bincode::deserialize(&raw).context("eip712 signature")
+}
+
+fn json_f64(value: Option<&Value>) -> Option<f64> {
+    match value? {
+        Value::String(s) => s.parse().ok(),
+        Value::Number(n) => n.as_f64(),
+        _ => None,
+    }
+}
+
+fn u256_to_f64(value: U256) -> f64 {
+    value.to_string().parse().unwrap_or(0.0)
 }
 
 fn json_u256(value: Option<&Value>) -> U256 {

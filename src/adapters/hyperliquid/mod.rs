@@ -5,11 +5,13 @@ use alloy::primitives::{Address, U256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Result;
 use futures_util::StreamExt;
-use log::{info, warn};
+use log::warn;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::account::{Account, AccountStore, Inflight, Paper, Position};
+use crate::account::{
+    Account, AccountStore, Inflight, Paper, Position, DEFAULT_MINT_RATE_RAW,
+};
 use crate::venue::Venue;
 
 use self::intent::IntentClient;
@@ -233,11 +235,6 @@ async fn apply_wallet(store: &AccountStore, data: &str) -> Result<()> {
     }
 
     let account = parse_snapshot(&value, revision);
-    info!(
-        "account snapshot revision={revision} positions={} paper={}",
-        account.positions.len(),
-        account.paper.balance
-    );
     *guard = Some(account);
     Ok(())
 }
@@ -252,6 +249,7 @@ fn parse_snapshot(value: &Value, revision: u64) -> Account {
         inflight: Vec::new(),
         token_scale: WAD,
         indexed_claim: false,
+        mint_rate_raw: DEFAULT_MINT_RATE_RAW,
     };
     if let Some(keys) = value.get("sessionKeys").and_then(|v| v.as_array()) {
         account.session_keys = parse_keys(keys);
@@ -301,11 +299,19 @@ fn parse_position(value: &Value) -> Option<Position> {
     if instrument_id != BTC_INSTRUMENT_ID {
         return None;
     }
+    let entry = json_u128(row.get(4))? as f64 / BTC_PRICE_SCALE;
+    let margin = json_u128(row.get(5))? as f64 / WAD as f64;
+    let leverage = json_u64(row.get(6)).unwrap_or(1).max(1) as f64;
+    let notional = margin * leverage;
+    let size = if entry > 0.0 { notional / entry } else { 0.0 };
     Some(Position {
         id: json_string(row.first()?)?,
         is_long: row.get(2).and_then(|v| v.as_bool()).unwrap_or(false),
-        entry: json_u128(row.get(4))? as f64 / BTC_PRICE_SCALE,
+        entry,
         bust: json_u128(row.get(7))? as f64 / BTC_PRICE_SCALE,
+        margin,
+        size,
+        notional,
     })
 }
 
